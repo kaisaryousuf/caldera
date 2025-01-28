@@ -21,7 +21,7 @@ class Contact(BaseWorld):
     async def start(self):
         loop = asyncio.get_event_loop()
         tcp = self.get_config('app.contact.tcp')
-        loop.create_task(asyncio.start_server(self.tcp_handler.accept, *tcp.split(':'), loop=loop))
+        loop.create_task(asyncio.start_server(self.tcp_handler.accept, *tcp.split(':')))
         loop.create_task(self.operation_loop())
 
     async def operation_loop(self):
@@ -85,6 +85,7 @@ class TcpSessionHandler(BaseWorld):
         try:
             conn = next(i.connection for i in self.sessions if i.id == int(session_id))
             conn.send(str.encode(' '))
+            time.sleep(0.01)
             conn.send(str.encode('%s\n' % cmd))
             response = await self._attempt_connection(session_id, conn, timeout=timeout)
             response = json.loads(response)

@@ -21,6 +21,7 @@ class OperationApiManager(BaseApiManager):
     def __init__(self, services):
         super().__init__(data_svc=services['data_svc'], file_svc=services['file_svc'])
         self.services = services
+        self.knowledge_svc = services['knowledge_svc']
 
     async def get_operation_report(self, operation_id: str, access: dict, output: bool):
         operation = await self.get_operation_object(operation_id, access)
@@ -80,13 +81,15 @@ class OperationApiManager(BaseApiManager):
         if link_data.get('command'):
             command_str = link_data.get('command')
             link.executor.command = command_str
-            link.ability = self.build_ability({}, link.executor)
+            link.ability = self.build_ability(link_data.get('ability', {}), link.executor)
             link.command = self._encode_string(command_str)
         if link_data.get('status'):
             link_status = link_data['status']
             if not link.is_valid_status(link_status):
                 raise JsonHttpBadRequest(f'Cannot update link {link_id} due to invalid link status.')
             link.status = link_status
+            if link.can_ignore():
+                operation.add_ignored_link(link.id)
         return link.display
 
     async def create_potential_link(self, operation_id: str, data: dict, access: BaseWorld.Access):
@@ -95,10 +98,11 @@ class OperationApiManager(BaseApiManager):
         agent = await self.get_agent(operation, data)
         if data['executor']['name'] not in agent.executors:
             raise JsonHttpBadRequest(f'Agent {agent.paw} missing specified executor')
-        encoded_command = self._encode_string(data['executor']['command'])
+        encoded_command = self._encode_string(agent.replace(self._encode_string(data['executor']['command']),
+                                              file_svc=self.services['file_svc']))
         executor = self.build_executor(data=data.pop('executor', {}), agent=agent)
         ability = self.build_ability(data=data.pop('ability', {}), executor=executor)
-        link = Link.load(dict(command=encoded_command, paw=agent.paw, ability=ability, executor=executor,
+        link = Link.load(dict(command=encoded_command, plaintext_command=encoded_command, paw=agent.paw, ability=ability, executor=executor,
                               status=operation.link_status(), score=data.get('score', 0), jitter=data.get('jitter', 0),
                               cleanup=data.get('cleanup', 0), pin=data.get('pin', 0),
                               host=agent.host, deadman=data.get('deadman', False), used=data.get('used', []),
@@ -202,6 +206,63 @@ class OperationApiManager(BaseApiManager):
         except IndexError:
             raise JsonHttpNotFound(f'Agent {data["paw"]} was not found.')
         return agent
+
+    def get_agents(self, operation: dict):
+        agents = {}
+        chain = operation.get('chain', [])
+        for link in chain:
+            paw = link.get('paw')
+            if paw and paw not in agents:
+                tmp_agent = self.find_object('agents', {'paw': paw}).display
+                tmp_agent['links'] = []
+                agents[paw] = tmp_agent
+            agents[paw]['links'].append(link)
+        return agents
+
+    async def get_hosts(self, operation: dict):
+        hosts = {}
+        chain = operation.get('chain', [])
+        for link in chain:
+            host = link.get('host')
+            if not host:
+                continue
+            if host not in hosts:
+                tmp_agent = self.find_object('agents', {'host': host}).display
+                tmp_host = {
+                    'host': tmp_agent.get('host'),
+                    'host_ip_addrs': tmp_agent.get('host_ip_addrs'),
+                    'platform': tmp_agent.get('platform'),
+                    'reachable_hosts': await self.get_reachable_hosts(agent=tmp_agent)
+                }
+                hosts[host] = tmp_host
+        return hosts
+
+    async def get_reachable_hosts(self, agent: dict = None, operation: dict = None):
+        """
+        NOTE: When agent is supplied, only hosts discovered by agent
+        are retrieved.
+        """
+        trait_names = BaseWorld.get_config('reachable_host_traits') or []
+        paws = ()
+
+        if agent is not None:
+            paws = paws + (agent.get('paw'),)
+        else:
+            for agent in operation.get('host_group', []):
+                paw = agent.get('paw')
+                if paw:
+                    paws = paws + (paw,)
+
+        hosts = []
+        for trait in trait_names:
+            fqdns = await self.services['knowledge_svc'].get_facts({
+                'trait': trait,
+                'collected_by': paws,
+            })
+            for name in fqdns:
+                hosts.append(name.value)
+
+        return hosts
 
     def build_executor(self, data: dict, agent: Agent):
         if not data.get('timeout'):

@@ -4,7 +4,9 @@ import glob
 import hashlib
 import json
 import os
+import re
 import time
+import uuid
 from collections import namedtuple
 from datetime import datetime, timezone
 from importlib import import_module
@@ -13,12 +15,13 @@ import aiohttp_jinja2
 import jinja2
 import yaml
 from aiohttp import web
+import croniter
 
 from app.objects.c_plugin import Plugin
 from app.service.interfaces.i_app_svc import AppServiceInterface
 from app.utility.base_service import BaseService
 
-Error = namedtuple('Error', ['name', 'msg'])
+Error = namedtuple('Error', ['name', 'msg', 'optional'])
 
 
 class AppService(AppServiceInterface, BaseService):
@@ -46,6 +49,7 @@ class AppService(AppServiceInterface, BaseService):
                     if silence_time > (self.get_config(name='agents', prop='untrusted_timer') + int(a.sleep_max)):
                         self.log.debug('Agent (%s) now untrusted. Last seen %s sec ago' % (a.paw, int(silence_time)))
                         a.trusted = 0
+                        await self.update_operations_with_untrusted_agent(a)
                     else:
                         trust_time_left = self.get_config(name='agents', prop='untrusted_timer') - silence_time
                         if trust_time_left < next_check:
@@ -53,6 +57,12 @@ class AppService(AppServiceInterface, BaseService):
                 await asyncio.sleep(15)
         except Exception as e:
             self.log.error(repr(e), exc_info=True)
+
+    async def update_operations_with_untrusted_agent(self, untrusted_agent):
+        all_operations = await self.get_service('data_svc').locate('operations')
+        for op in all_operations:
+            if (not await op.is_finished()) and any(untrusted_agent.paw == agent.paw for agent in op.agents):
+                op.update_untrusted_agents(untrusted_agent)
 
     async def find_link(self, unique):
         operations = await self.get_service('data_svc').locate('operations')
@@ -75,12 +85,24 @@ class AppService(AppServiceInterface, BaseService):
         while True:
             interval = 60
             for s in await self.get_service('data_svc').locate('schedules'):
-                now = datetime.now(timezone.utc).time()
-                today_utc = datetime.now(timezone.utc).date()
-                diff = datetime.combine(today_utc, now) - datetime.combine(today_utc, s.schedule)
+                if not croniter.croniter.is_valid(s.schedule):
+                    match = re.match(r'^(\d{2}):(\d{2}):\d{2}\.\d{6}$', s.schedule)
+                    if match:
+                        hour, minute = match.groups()
+                        s.schedule = f"{minute} {hour} * * *"
+                        self.log.info(f"Converted time schedule {s.id} to cron format: {s.schedule}")
+                    else:
+                        self.log.warning(f"The schedule {s.id} with the format `{s.schedule}` is incompatible with cron!")
+                        continue
+
+                now = datetime.now()
+                cron = croniter.croniter(s.schedule, now)
+                diff = now - cron.get_prev(datetime)
                 if interval > diff.total_seconds() > 0:
                     self.log.debug('Pulling %s off the scheduler' % s.id)
                     sop = copy.deepcopy(s.task)
+                    sop.id = str(uuid.uuid4())
+                    sop.name += f" ({datetime.now(timezone.utc).replace(microsecond=0).isoformat()})"
                     sop.set_start_details()
                     await sop.update_operation_agents(self.get_services())
                     await self._services.get('data_svc').store(sop)
@@ -104,7 +126,7 @@ class AppService(AppServiceInterface, BaseService):
                 await self.get_service('data_svc').store(plugin)
                 self._loaded_plugins.append(plugin)
 
-            if plugin.name in self.get_config('plugins'):
+            if plugin.name in self.get_config('plugins') or plugin.name == 'magma':
                 await plugin.enable(self.get_services())
                 self.log.info('Enabled plugin: %s' % plugin.name)
 
@@ -115,11 +137,11 @@ class AppService(AppServiceInterface, BaseService):
             asyncio.get_event_loop().create_task(load(plug))
 
         templates = ['plugins/%s/templates' % p.lower() for p in self.get_config('plugins')]
-        templates.append('templates')
+        templates.append('plugins/magma/dist')
         aiohttp_jinja2.setup(self.application, loader=jinja2.FileSystemLoader(templates))
 
-    async def retrieve_compiled_file(self, name, platform):
-        _, path = await self._services.get('file_svc').find_file_path('%s-%s' % (name, platform))
+    async def retrieve_compiled_file(self, name, platform, location=''):
+        _, path = await self._services.get('file_svc').find_file_path('%s-%s' % (name, platform), location=location)
         signature = hashlib.sha256(open(path, 'rb').read()).hexdigest()
         display_name = await self._services.get('contact_svc').build_filename()
         self.log.debug('%s downloaded with hash=%s and name=%s' % (name, signature, display_name))
@@ -127,6 +149,7 @@ class AppService(AppServiceInterface, BaseService):
 
     async def teardown(self, main_config_file='default'):
         await self._destroy_plugins()
+        await self._deregister_contacts()
         await self._save_configurations(main_config_file=main_config_file)
         await self._services.get('data_svc').save_state()
         await self._services.get('knowledge_svc').save_state()
@@ -147,19 +170,23 @@ class AppService(AppServiceInterface, BaseService):
             tunnel_class = import_module(tunnel_module_name).Tunnel
             await contact_svc.register_tunnel(tunnel_class(self.get_services()))
 
+    async def _deregister_contacts(self):
+        contact_svc = self.get_service('contact_svc')
+        await contact_svc.deregister_contacts()
+
     async def validate_requirement(self, requirement, params):
         if not self.check_requirement(params):
             msg = '%s does not meet the minimum version of %s' % (requirement, params['version'])
             if params.get('optional', False):
                 msg = '. '.join([
                     msg,
-                    '%s is an optional dependency and its absence will not affect Caldera\'s core operation' % requirement.capitalize(),
+                    '%s is an optional dependency which adds more functionality' % requirement.capitalize(),
                     params.get('reason', '')
                 ])
                 self.log.warning(msg)
             else:
                 self.log.error(msg)
-            self._errors.append(Error('requirement', '%s version needs to be >= %s' % (requirement, params['version'])))
+            self._errors.append(Error('requirement', '%s version needs to be >= %s' % (requirement, params['version']), params.get('optional')))
             return False
         return True
 

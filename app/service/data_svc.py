@@ -37,6 +37,12 @@ DATA_FILE_GLOBS = (
     'data/object_store',
 )
 
+PAYLOADS_CONFIG_STANDARD_KEY = 'standard_payloads'
+PAYLOADS_CONFIG_SPECIAL_KEY = 'special_payloads'
+PAYLOADS_CONFIG_EXTENSIONS_KEY = 'extensions'
+
+DEPRECATION_WARNING_LOAD = "Function deprecated and will be removed in a future update. Use load_yaml_file"
+
 
 class DataService(DataServiceInterface, BaseService):
 
@@ -165,7 +171,7 @@ class DataService(DataServiceInterface, BaseService):
                 ab.pop('plugin', plugin)
 
                 if tactic and tactic not in filename:
-                    self.log.error('Ability=%s has wrong tactic' % id)
+                    self.log.error('Ability=%s has wrong tactic' % ability_id)
 
                 await self._create_ability(ability_id=ability_id, name=name, description=description, tactic=tactic,
                                            technique_id=technique_id, technique_name=technique_name,
@@ -236,15 +242,15 @@ class DataService(DataServiceInterface, BaseService):
         return [RequirementSchema().load(entry) for entry in requirements]
 
     async def load_adversary_file(self, filename, access):
-        warnings.warn("Function deprecated and will be removed in a future update. Use load_yaml_file", DeprecationWarning)
+        warnings.warn(DEPRECATION_WARNING_LOAD, DeprecationWarning, stacklevel=2)
         await self.load_yaml_file(Adversary, filename, access)
 
     async def load_source_file(self, filename, access):
-        warnings.warn("Function deprecated and will be removed in a future update. Use load_yaml_file", DeprecationWarning)
+        warnings.warn(DEPRECATION_WARNING_LOAD, DeprecationWarning, stacklevel=2)
         await self.load_yaml_file(Source, filename, access)
 
     async def load_objective_file(self, filename, access):
-        warnings.warn("Function deprecated and will be removed in a future update. Use load_yaml_file", DeprecationWarning)
+        warnings.warn(DEPRECATION_WARNING_LOAD, DeprecationWarning, stacklevel=2)
         await self.load_yaml_file(Objective, filename, access)
 
     async def load_yaml_file(self, object_class, filename, access):
@@ -253,6 +259,25 @@ class DataService(DataServiceInterface, BaseService):
             obj.access = access
             obj.plugin = self._get_plugin_name(filename)
             await self.store(obj)
+
+    async def create_or_update_everything_adversary(self):
+        everything = {
+            'id': '785baa02-df5d-450a-ab3a-1a863f22b4b0',
+            'name': 'Everything Bagel',
+            'description': 'An adversary with all adversary abilities',
+            'atomic_ordering': [
+                ability.ability_id
+                for ability in await self.locate('abilities')
+                if (
+                    ability.access == self.Access.RED
+                    or ability.access == self.Access.APP
+                )
+                and ability.plugin != 'training'
+            ],
+        }
+        obj = Adversary.load(everything)
+        obj.access = self.Access.RED
+        await self.store(obj)
 
     async def _load(self, plugins=()):
         try:
@@ -273,6 +298,7 @@ class DataService(DataServiceInterface, BaseService):
                 await task
             await self._load_extensions()
             await self._load_data_encoders(plugins)
+            await self.create_or_update_everything_adversary()
             await self._verify_data_sets()
         except Exception as e:
             self.log.debug(repr(e), exc_info=True)
@@ -310,15 +336,52 @@ class DataService(DataServiceInterface, BaseService):
             await self.load_yaml_file(Objective, filename, plugin.access)
 
     async def _load_payloads(self, plugin):
+        payload_config = dict(
+            standard_payloads=dict(),
+            special_payloads=dict(),
+            extensions=dict(),
+        )
         for filename in glob.iglob('%s/payloads/*.yml' % plugin.data_dir, recursive=False):
             data = self.strip_yml(filename)
-            payload_config = self.get_config(name='payloads')
-            payload_config['standard_payloads'] = data[0]['standard_payloads']
-            payload_config['special_payloads'] = data[0]['special_payloads']
-            payload_config['extensions'] = data[0]['extensions']
-            await self._apply_special_payload_hooks(payload_config['special_payloads'])
-            await self._apply_special_extension_hooks(payload_config['extensions'])
-            self.apply_config(name='payloads', config=payload_config)
+            special_payloads = data[0].get(PAYLOADS_CONFIG_SPECIAL_KEY, dict())
+            extensions = data[0].get(PAYLOADS_CONFIG_EXTENSIONS_KEY, dict())
+            standard_payloads = data[0].get(PAYLOADS_CONFIG_STANDARD_KEY, dict())
+            payload_config[PAYLOADS_CONFIG_STANDARD_KEY].update(standard_payloads)
+            if special_payloads:
+                await self._apply_special_payload_hooks(special_payloads)
+                payload_config[PAYLOADS_CONFIG_SPECIAL_KEY].update(special_payloads)
+            if extensions:
+                await self._apply_special_extension_hooks(extensions)
+                payload_config[PAYLOADS_CONFIG_EXTENSIONS_KEY].update(extensions)
+        self._update_payload_config(payload_config, plugin.name)
+
+    def _update_payload_config(self, updates, curr_plugin_name):
+        payload_config = self.get_config(name='payloads')
+        curr_standard_payloads = payload_config.get(PAYLOADS_CONFIG_STANDARD_KEY, dict())
+        curr_special_payloads = payload_config.get(PAYLOADS_CONFIG_SPECIAL_KEY, dict())
+        curr_extensions = payload_config.get(PAYLOADS_CONFIG_EXTENSIONS_KEY, dict())
+        new_standard_payloads = updates.get(PAYLOADS_CONFIG_STANDARD_KEY, dict())
+        new_special_payloads = updates.get(PAYLOADS_CONFIG_SPECIAL_KEY, dict())
+        new_extensions = updates.get(PAYLOADS_CONFIG_EXTENSIONS_KEY, dict())
+
+        self._check_payload_overlaps(curr_standard_payloads, new_standard_payloads, PAYLOADS_CONFIG_STANDARD_KEY,
+                                     curr_plugin_name)
+        self._check_payload_overlaps(curr_special_payloads, new_special_payloads, PAYLOADS_CONFIG_SPECIAL_KEY,
+                                     curr_plugin_name)
+        self._check_payload_overlaps(curr_extensions, new_extensions, PAYLOADS_CONFIG_EXTENSIONS_KEY, curr_plugin_name)
+
+        payload_config[PAYLOADS_CONFIG_STANDARD_KEY] = {**curr_standard_payloads, **new_standard_payloads}
+        payload_config[PAYLOADS_CONFIG_SPECIAL_KEY] = {**curr_special_payloads, **new_special_payloads}
+        payload_config[PAYLOADS_CONFIG_EXTENSIONS_KEY] = {**curr_extensions, **new_extensions}
+        self.apply_config(name='payloads', config=payload_config)
+
+    def _check_payload_overlaps(self, old_dict, new_dict, config_section_name, curr_plugin_name):
+        overlap = set(old_dict).intersection(new_dict)
+        for payload in overlap:
+            if old_dict[payload] != new_dict[payload]:
+                self.log.warning('Config for %s already exists in the %s section of the payloads config and will be '
+                                 'overridden using new payload config data from plugin %s', payload,
+                                 config_section_name, curr_plugin_name)
 
     async def _load_planners(self, plugin):
         for filename in glob.iglob('%s/planners/*.yml' % plugin.data_dir, recursive=False):
@@ -388,7 +451,6 @@ class DataService(DataServiceInterface, BaseService):
         required_fields = ['name', 'description', 'tactic', 'technique_id', 'technique_name']
         special_extensions = [special_payload for special_payload in
                               self.get_service('file_svc').special_payloads if special_payload.startswith('.')]
-        cleanup_abilities = await self.locate('abilities', dict(ability_id='4cd4eb44-29a7-4259-91ae-e457b283a880'))
         for ability in await self.locate('abilities'):
             for field in required_fields:
                 if not getattr(ability, field):
@@ -407,14 +469,6 @@ class DataService(DataServiceInterface, BaseService):
                         self.log.warning('Payload referenced in %s but not found: %s', ability.ability_id, payload)
                         continue
 
-                    for cleanup_ability in cleanup_abilities:
-                        cleanup_executor = cleanup_ability.find_executor(executor.name, executor.platform)
-                        if cleanup_executor and cleanup_executor.cleanup:
-                            payload_name = '#{payload:%s}' % payload if self.is_uuid4(payload) else payload
-                            cleanup_command = executor.replace_cleanup(cleanup_executor.cleanup[0], payload_name)
-                            if cleanup_command not in executor.cleanup:
-                                executor.cleanup.append(cleanup_command)
-
     async def _verify_default_objective_exists(self):
         if not await self.locate('objectives', match=dict(name='default')):
             await self.store(Objective(id='495a9828-cab1-44dd-a0ca-66e58177d8cc', name='default',
@@ -427,3 +481,12 @@ class DataService(DataServiceInterface, BaseService):
     def _get_plugin_name(self, filename):
         plugin_path = pathlib.PurePath(filename).parts
         return plugin_path[1] if 'plugins' in plugin_path else ''
+
+    async def get_facts_from_source(self, fact_source_id):
+        fact_sources = await self.locate('sources', match=dict(id=fact_source_id))
+        if len(fact_sources) == 0:
+            return []
+        elif len(fact_sources) > 1:
+            self.log.error('Found multiple fact sources with the same id', fact_source_id)
+            return []
+        return fact_sources[0].facts

@@ -56,15 +56,46 @@ function apiV2(requestType, endpoint, body = null, jsonRequest = true) {
     });
 }
 
-//
-// Parse timestamp into human-friendly date format
-// Modified from original code: https://stackoverflow.com/questions/7641791/javascript-library-for-human-friendly-relative-date-formatting
-//
-// Expected input: (i.e.) 2021-08-25 10:03:23
-// Output: (i.e.) 5 hrs ago; (i.e. if older than 1 day): yesterday 10:03:23; (i.e. if older than 2 days): Aug 25 10:03:23
-//
+/**
+ * Given list of abilities, returns list filtered by the following
+ * @param abilities {object[]} - List of abilities to be filtered
+ * @param searchTerm {string} - Search query keyword
+ * @param tactic {string} - Tactic name
+ * @param technique {object} - Technique ID and name
+ * @param platforms {string[]} - List of ability platforms
+ * @param plugins {string} = Ability plugin
+ * @param executors {string[]} - List of ability executors
+ * @returns {object[]} - List of filtered abilities
+ */
+function getFilteredAbilities(abilities, searchTerm, tactic, technique, platforms = null, plugins = '', executors = null) {
+    return abilities.filter((ability, index) => {
+        let matchesQuery = (
+            ability.name.toLowerCase().includes(searchTerm) ||
+            ability.description.toLowerCase().includes(searchTerm) ||
+            ability.tactic.toLowerCase().includes(searchTerm) ||
+            ability.technique_id.toLowerCase().includes(searchTerm) ||
+            ability.technique_name.toLowerCase().includes(searchTerm)
+        );
+        let matchesTactic = (!tactic || ability.tactic === tactic);
+        let matchesTechnique = (!technique || `${ability.technique_id} | ${ability.technique_name}` === technique);
+        let abilityPlatforms = ability.executors.map((exec) => exec.platform);
+        let matchesPlatform = (!platforms) || abilityPlatforms.some((platform) => platforms.includes(platform));
+        if (executors) matchesPlatform = matchesPlatform || ability.executors.some((exec) => executors.includes(exec.name));
+        let matchesPlugin = (!plugins || !plugins.includes(ability.plugin));
+
+        return matchesQuery && matchesTactic && matchesTechnique && matchesPlatform && matchesPlugin;
+    });
+}
+
+/**
+ * Parse timestamp into human-friendly date format
+ * Modified from original code: https://stackoverflow.com/questions/7641791/javascript-library-for-human-friendly-relative-date-formatting
+ * @param date {string} - i.e. '2021-08-03 19:37:08'
+ * @returns {string} (i.e.) '5 hrs ago';
+*                    (i.e. if older than 1 day): 'yesterday 10:03:23';
+ *                   (i.e. if older than 2 days): 'Aug 25 10:03:23'
+ */
 function getHumanFriendlyTime(date) {
-    // i.e. format 2021-08-03 19:37:08
     if (!date) return '';
     let split = date.split('-');
 
@@ -143,11 +174,11 @@ function getHumanFriendlyTime(date) {
     return fuzzy;
 }
 
-//
-// Parse timestamp into human-friendly date format
-// Expected ISO8601 input in UTC time: (i.e.) 2021-08-25T10:03:23Z
-// Output: (i.e.) 5 hrs ago; (i.e. if older than 1 day): yesterday 10:03:23; (i.e. if older than 2 days): Aug 25 10:03:23
-//
+/**
+ * Parse timestamp into human-friendly date ISO8601-safe format
+ * @param dateTime {string} - Expected ISO8601 input in UTC time: (i.e.) 2021-08-25T10:03:23Z
+ * @returns {string} - (i.e.) '5 hrs ago'
+ */
 function getHumanFriendlyTimeISO8601(dateTime) {
 	return getHumanFriendlyTime(dateTime.replace('T', ' ').replace('Z', ''));
 }
@@ -161,9 +192,15 @@ function sortAlphabetically(list) {
     })
 }
 
+function sanitize(unsafeMsg) {
+    const parser = new DOMParser();
+    let doc = parser.parseFromString(unsafeMsg, 'text/html');
+    return doc.body.innerText;
+}
+
 function toast(message, success) {
     bulmaToast.toast({
-        message: `<span class="icon"><i class="fas fa-${success ? 'check' : 'exclamation'}"></i></span> ${message}`,
+        message: `<span class="icon"><i class="fas fa-${success ? 'check' : 'exclamation'}"></i></span> ${sanitize(message)}`,
         type: `toast ${success ? 'is-success' : 'is-danger'}`,
         position: 'bottom-right',
         duration: '3000',
@@ -219,41 +256,6 @@ function uuidv4() {
     });
 }
 
-// TODO: JQuery functions
-
-function showHide(show, hide) {
-    $(show).each(function () {
-        $(this).prop('disabled', false).css('opacity', 1.0)
-    });
-    $(hide).each(function () {
-        $(this).prop('disabled', true).css('opacity', 0.5)
-    });
-}
-
-function validateFormState(conditions, selector) {
-    (conditions) ?
-        updateButtonState(selector, 'valid') :
-        updateButtonState(selector, 'invalid');
-}
-
-function updateButtonState(selector, state) {
-    (state === 'valid') ?
-        $(selector).attr('class', 'button-success atomic-button') :
-        $(selector).attr('class', 'button-notready atomic-button');
-}
-
-function stream(msg, speak = false) {
-    let streamer = $('#streamer');
-    if (streamer.text() != msg) {
-        streamer.fadeOut(function () {
-            if (speak) {
-                window.speechSynthesis.speak(new SpeechSynthesisUtterance(msg));
-            }
-            $(this).text(msg).fadeIn(1000);
-        });
-    }
-}
-
 /* SECTIONS */
 
 // Alternative to JQuery parseHTML(keepScripts=true)
@@ -275,33 +277,6 @@ function setInnerHTML(elem, html) {
 // TODO: remove this from all individual plugins in future, as close (x) will be in the tab rather than inside the plugins itself
 function removeSection(identifier) {
     $('#' + identifier).remove();
-}
-
-/* AUTOMATIC functions for all pages */
-
-$(document).ready(function () {
-    $(document).find("select").each(function () {
-        if (!$(this).hasClass('avoid-alphabetizing')) {
-            alphabetize_dropdown($(this));
-            let observer = new MutationObserver(function (mutations, obs) {
-                obs.disconnect();
-                alphabetize_dropdown($(mutations[0].target));
-                obs.observe(mutations[0].target, {childList: true});
-            });
-            observer.observe(this, {childList: true});
-        }
-    });
-});
-
-function alphabetize_dropdown(obj) {
-    let selected_val = $(obj).children("option:selected").val();
-    let disabled = $(obj).find('option:disabled');
-    let opts_list = $(obj).find('option:enabled').clone(true);
-    opts_list.sort(function (a, b) {
-        return a.text.toLowerCase() == b.text.toLowerCase() ? 0 : a.text.toLowerCase() < b.text.toLowerCase() ? -1 : 1;
-    });
-    $(obj).empty().append(opts_list).prepend(disabled);
-    obj.val(selected_val);
 }
 
 function b64DecodeUnicode(str) { //https://stackoverflow.com/a/30106551

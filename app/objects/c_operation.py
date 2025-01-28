@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import uuid
 from collections import defaultdict
@@ -25,11 +26,19 @@ from app.utility.base_service import BaseService
 NO_PREVIOUS_STATE = object()
 
 
+class InvalidOperationStateError(Exception):
+    pass
+
+
 class OperationOutputRequestSchema(ma.Schema):
-    enable_agent_output = ma.fields.Boolean(default=False)
+    enable_agent_output = ma.fields.Boolean(dump_default=False)
 
 
 class OperationSchema(ma.Schema):
+
+    class Meta:
+        unknown = ma.EXCLUDE
+
     id = ma.fields.String()
     name = ma.fields.String(required=True)
     host_group = ma.fields.List(ma.fields.Nested(AgentSchema()), attribute='agents', dump_only=True)
@@ -45,7 +54,7 @@ class OperationSchema(ma.Schema):
     visibility = ma.fields.Integer()
     objective = ma.fields.Nested(ObjectiveSchema())
     use_learning_parsers = ma.fields.Boolean()
-    group = ma.fields.String(missing='')
+    group = ma.fields.String(load_default='')
     source = ma.fields.Nested(SourceSchema())
 
     @ma.pre_load()
@@ -59,6 +68,23 @@ class OperationSchema(ma.Schema):
     @ma.post_load
     def build_operation(self, data, **kwargs):
         return None if kwargs.get('partial') is True else Operation(**data)
+
+
+class HostSchema(ma.Schema):
+    display_name = ma.fields.String(dump_only=True)
+    host = ma.fields.String()
+    host_ip_addrs = ma.fields.List(ma.fields.String(), allow_none=True)
+    platform = ma.fields.String()
+    reachable_hosts = ma.fields.List(ma.fields.String(), allow_none=True)
+
+
+class OperationSchemaAlt(OperationSchema):
+    chain = property(lambda: AttributeError)
+    host_group = property(lambda: AttributeError)
+    source = property(lambda: AttributeError)
+    visibility = property(lambda: AttributeError)
+    agents = ma.fields.Dict(keys=ma.fields.String(), values=ma.fields.Nested(AgentSchema()))
+    hosts = ma.fields.Dict(keys=ma.fields.String(), values=ma.fields.Nested(HostSchema()))
 
 
 class Operation(FirstClassObjectInterface, BaseObject):
@@ -116,6 +142,7 @@ class Operation(FirstClassObjectInterface, BaseObject):
         self.name = name
         self.group = group
         self.agents = agents if agents else []
+        self.untrusted_agents = set()
         self.adversary = adversary
         self.jitter = jitter
         self.source = source
@@ -128,6 +155,7 @@ class Operation(FirstClassObjectInterface, BaseObject):
         self.visibility = visibility
         self.objective = None
         self.chain, self.potential_links, self.rules = [], [], []
+        self.ignored_links = set()
         self.access = access if access else self.Access.APP
         self.use_learning_parsers = use_learning_parsers
         if source:
@@ -153,11 +181,16 @@ class Operation(FirstClassObjectInterface, BaseObject):
     def has_link(self, link_id):
         return any(lnk.id == link_id for lnk in self.potential_links + self.chain)
 
+    def update_untrusted_agents(self, agent):
+        if not agent.trusted and agent in self.agents:
+            self.untrusted_agents.add(agent.paw)
+
     async def all_facts(self):
         knowledge_svc_handle = BaseService.get_service('knowledge_svc')
+        data_svc_handle = BaseService.get_service('data_svc')
         seeded_facts = []
         if self.source:
-            seeded_facts = await knowledge_svc_handle.get_facts(criteria=dict(source=self.source.id))
+            seeded_facts = await data_svc_handle.get_facts_from_source(self.source.id)
         learned_facts = await knowledge_svc_handle.get_facts(criteria=dict(source=self.id))
         learned_facts = [f for f in learned_facts if f.score > 0]
         return seeded_facts + learned_facts
@@ -222,6 +255,8 @@ class Operation(FirstClassObjectInterface, BaseObject):
         """
         for link_id in link_ids:
             link = [link for link in self.chain if link.id == link_id][0]
+            if link.can_ignore():
+                self.add_ignored_link(link.id)
             member = [member for member in self.agents if member.paw == link.paw][0]
             while not (link.finish or link.can_ignore()):
                 await asyncio.sleep(5)
@@ -243,6 +278,9 @@ class Operation(FirstClassObjectInterface, BaseObject):
     def link_status(self):
         return -3 if self.autonomous else -1
 
+    def add_ignored_link(self, link_id):
+        self.ignored_links.add(link_id)
+
     async def active_agents(self):
         active = []
         for agent in self.agents:
@@ -259,14 +297,14 @@ class Operation(FirstClassObjectInterface, BaseObject):
         for agent in self.agents:
             agent_skipped = defaultdict(dict)
             agent_executors = agent.executors
-            agent_ran = set([link.ability.ability_id for link in self.chain if link.paw == agent.paw])
+            agent_ran = set([link.ability.ability_id for link in self.chain if link.paw == agent.paw and link.finish])
             for ab in abilities_by_agent[agent.paw]['all_abilities']:
                 skipped = self._check_reason_skipped(agent=agent, ability=ab, agent_executors=agent_executors,
                                                      op_facts=[f.trait for f in await self.all_facts()],
                                                      state=self.state, agent_ran=agent_ran)
                 if skipped:
                     if agent_skipped[skipped['ability_id']]:
-                        if agent_skipped[skipped['ability_id']]['reason_id'] < skipped['reason_id']:
+                        if agent_skipped[skipped['ability_id']]['reason_id'] > skipped['reason_id']:
                             agent_skipped[skipped['ability_id']] = skipped
                     else:
                         agent_skipped[skipped['ability_id']] = skipped
@@ -284,7 +322,8 @@ class Operation(FirstClassObjectInterface, BaseObject):
             for step in self.chain:
                 step_report = dict(link_id=step.id,
                                    ability_id=step.ability.ability_id,
-                                   command=step.command,
+                                   command=self.decode_bytes(step.command),
+                                   plaintext_command=self.decode_bytes(step.plaintext_command),
                                    delegated=step.decide.strftime(self.TIME_FORMAT),
                                    run=step.finish,
                                    status=step.status,
@@ -297,13 +336,13 @@ class Operation(FirstClassObjectInterface, BaseObject):
                                                technique_name=step.ability.technique_name,
                                                technique_id=step.ability.technique_id))
                 if output and step.output:
-                    step_report['output'] = self.decode_bytes(file_svc.read_result_file(step.unique))
+                    results = self.decode_bytes(file_svc.read_result_file(step.unique))
+                    step_report['output'] = json.loads(results.replace('\\r\\n', '').replace('\\n', ''))
                 if step.agent_reported_time:
                     step_report['agent_reported_time'] = step.agent_reported_time.strftime(self.TIME_FORMAT)
                 agents_steps[step.paw]['steps'].append(step_report)
             report['steps'] = agents_steps
             report['skipped_abilities'] = await self.get_skipped_abilities_by_agent(data_svc)
-
             return report
         except Exception:
             logging.error('Error saving operation report (%s)' % self.name, exc_info=True)
@@ -338,7 +377,7 @@ class Operation(FirstClassObjectInterface, BaseObject):
         logging.debug('Wrote event logs for operation %s to disk at %s/%s' % (self.name, event_logs_dir, file_name))
 
     async def _write_logs_to_disk(self, logs, file_name, dest_dir, file_svc):
-        logs_dumps = json.dumps(logs)
+        logs_dumps = json.dumps(logs) + os.linesep
         await file_svc.save_file(file_name, logs_dumps.encode(), dest_dir, encrypt=False)
 
     async def _load_objective(self, data_svc):
@@ -348,7 +387,8 @@ class Operation(FirstClassObjectInterface, BaseObject):
         self.objective = deepcopy(obj[0])
 
     async def _convert_link_to_event_log(self, link, file_svc, data_svc, output=False):
-        event_dict = dict(command=link.command,
+        event_dict = dict(command=self.decode_bytes(link.command),
+                          plaintext_command=self.decode_bytes(link.plaintext_command),
                           delegated_timestamp=link.decide.strftime(self.TIME_FORMAT),
                           collected_timestamp=link.collect.strftime(self.TIME_FORMAT) if link.collect else None,
                           finished_timestamp=link.finish,
@@ -361,7 +401,8 @@ class Operation(FirstClassObjectInterface, BaseObject):
                           operation_metadata=self._get_operation_metadata_for_event_log(),
                           attack_metadata=self._get_attack_metadata_for_event_log(link.ability))
         if output and link.output:
-            event_dict['output'] = self.decode_bytes(file_svc.read_result_file(link.unique))
+            results = self.decode_bytes(file_svc.read_result_file(link.unique))
+            event_dict['output'] = json.loads(results.replace('\\r\\n', '').replace('\\n', ''))
         if link.agent_reported_time:
             event_dict['agent_reported_time'] = link.agent_reported_time.strftime(self.TIME_FORMAT)
         return event_dict
@@ -422,8 +463,13 @@ class Operation(FirstClassObjectInterface, BaseObject):
 
     async def _get_all_possible_abilities_by_agent(self, data_svc):
         abilities = {'all_abilities': [ab for ab_id in self.adversary.atomic_ordering
-                     for ab in await data_svc.locate('abilities', match=dict(ability_id=ab_id))]}
-        return {a.paw: abilities for a in self.agents}
+                                       for ab in await data_svc.locate('abilities', match=dict(ability_id=ab_id))]}
+        abilities_by_agent = {a.paw: abilities for a in self.agents}
+        for link in self.chain:
+            if link.ability.ability_id not in self.adversary.atomic_ordering:
+                matching_abilities = await data_svc.locate('abilities', match=dict(ability_id=link.ability.ability_id))
+                abilities_by_agent[link.paw]['all_abilities'].extend(matching_abilities)
+        return abilities_by_agent
 
     def _check_reason_skipped(self, agent, ability, op_facts, state, agent_executors, agent_ran):
         if ability.ability_id in agent_ran:
@@ -436,21 +482,33 @@ class Operation(FirstClassObjectInterface, BaseObject):
             facts = re.findall(BasePlanningService.re_variable, executor.test) if executor.command else []
             if not facts or all(fact in op_facts for fact in facts):
                 fact_dependency_fulfilled = True
+        associated_links = set([link.id for link in self.chain if link.paw == agent.paw
+                                and link.ability.ability_id == ability.ability_id])
 
-        if not agent.trusted:
-            return dict(reason='Agent untrusted', reason_id=self.Reason.UNTRUSTED.value,
+        if agent.platform == 'unknown':
+            return dict(reason='Platform not available', reason_id=self.Reason.PLATFORM.value,
                         ability_id=ability.ability_id, ability_name=ability.name)
         elif not valid_executors:
-            return dict(reason='Executor not available', reason_id=self.Reason.EXECUTOR.value,
-                        ability_id=ability.ability_id, ability_name=ability.name)
-        elif not fact_dependency_fulfilled:
-            return dict(reason='Fact dependency not fulfilled', reason_id=self.Reason.FACT_DEPENDENCY.value,
+            return dict(reason='Mismatched ability platform and executor', reason_id=self.Reason.EXECUTOR.value,
                         ability_id=ability.ability_id, ability_name=ability.name)
         elif not agent.privileged_to_run(ability):
             return dict(reason='Ability privilege not fulfilled', reason_id=self.Reason.PRIVILEGE.value,
                         ability_id=ability.ability_id, ability_name=ability.name)
+        elif not fact_dependency_fulfilled:
+            return dict(reason='Fact dependency not fulfilled', reason_id=self.Reason.FACT_DEPENDENCY.value,
+                        ability_id=ability.ability_id, ability_name=ability.name)
+        elif not set(associated_links).isdisjoint(self.ignored_links):
+            return dict(reason='Link ignored - highly visible or discarded link',
+                        reason_id=self.Reason.LINK_IGNORED.value, ability_id=ability.ability_id,
+                        ability_name=ability.name)
+        elif not agent.trusted:
+            return dict(reason='Agent not trusted', reason_id=self.Reason.UNTRUSTED.value,
+                        ability_id=ability.ability_id, ability_name=ability.name)
         elif state != 'finished':
             return dict(reason='Operation not completed', reason_id=self.Reason.OP_RUNNING.value,
+                        ability_id=ability.ability_id, ability_name=ability.name)
+        else:
+            return dict(reason='Other', reason_id=self.Reason.OTHER.value,
                         ability_id=ability.ability_id, ability_name=ability.name)
 
     def _get_operation_metadata_for_event_log(self):
@@ -508,10 +566,12 @@ class Operation(FirstClassObjectInterface, BaseObject):
     class Reason(Enum):
         PLATFORM = 0
         EXECUTOR = 1
-        FACT_DEPENDENCY = 2
-        PRIVILEGE = 3
-        OP_RUNNING = 4
+        PRIVILEGE = 2
+        FACT_DEPENDENCY = 3
+        LINK_IGNORED = 4
         UNTRUSTED = 5
+        OP_RUNNING = 6
+        OTHER = 7
 
     class States(Enum):
         RUNNING = 'running'

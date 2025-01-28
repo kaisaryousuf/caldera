@@ -7,11 +7,29 @@ function alpineCore() {
         errors: startupErrors,
         showErrors: false,
         version: '0.0.0',
+        isFirstVisit: false,
+        scrollTop: window.scrollY,
 
         initPage() {
+            window.onscroll = () => {
+                this.scrollTop = window.scrollY;
+            };
+
             apiV2('GET', '/api/v2/health').then((response) => {
                 this.version = response.version;
-            })
+                this.checkIfFirstVisit();
+            }).catch((error) => {
+                console.error(error);
+                toast('Error loading page', false);
+            });
+        },
+
+        checkIfFirstVisit() {
+            let localStorage = window.localStorage;
+            this.isFirstVisit = !localStorage.getItem('firstVisit');
+            if (this.isFirstVisit) {
+                localStorage.setItem('firstVisit', new Date().toISOString());
+            }
         },
 
         setTabContent(tab, html) {
@@ -69,9 +87,9 @@ function alpineCore() {
             }
 
             if (this.activeTabIndex >= index) {
-                this.activeTabIndex -= 1;
+                this.activeTabIndex = Math.max(0, this.activeTabIndex - 1);
             }
-            
+
             this.openTabs.splice(index, 1);
         },
 

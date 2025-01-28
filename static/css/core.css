@@ -19,6 +19,10 @@ body {
   color: white;
 }
 
+.card-header {
+  border-bottom: 1px solid #606060;
+}
+
 .level {
   width: 100%;
 }
@@ -26,10 +30,16 @@ body {
 #active-tab-display {
   color: white;
   max-width: initial;
+  margin-top: 62px;
 }
 
 [data-tooltip]::before {
   min-width: 150px;
+}
+
+.fancy-button:hover {
+  background-image: linear-gradient(to right, #8B0000, #191970) !important; 
+  border-width: 2px;
 }
 
 .icon.is-close:hover {
@@ -60,7 +70,7 @@ main.main {
 .menu-label.nav-header {
   cursor: default;
   background: none !important;
-  border-bottom: 2px solid #8B0000;
+  border-bottom: 2px solid var(--primary-color);
   font-size: 0.75em;
   letter-spacing: 0.1em;
   color: white !important;
@@ -135,9 +145,13 @@ main.main {
   flex-direction: column;
   justify-content: center;
   align-items: center;
+  margin-top: 62px;
 }
 
 .nav.tabs {
+  position: fixed;
+  width: 100%;
+  z-index: 10;
   display: block !important;
   margin-bottom: 0 !important;
   padding: 10px 10px 0 10px;

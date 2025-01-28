@@ -7,6 +7,7 @@ import pathlib
 import uuid
 from datetime import time
 import re
+import logging
 
 import yaml
 from aiohttp import web
@@ -27,6 +28,7 @@ from app.utility.base_service import BaseService
 class RestService(RestServiceInterface, BaseService):
 
     def __init__(self):
+        logging.getLogger('asyncio').setLevel(logging.WARNING)
         self.log = self.add_service('rest_svc', self)
         self.loop = asyncio.get_event_loop()
 
@@ -434,7 +436,8 @@ class RestService(RestServiceInterface, BaseService):
         :type prop_name: str
         """
         abilities = []
-        for ability_id in [ability_id.strip() for ability_id in abilities_str.split(',') if ability_id.strip()]:
+        ability_id_list = [ability_id.strip() for ability_id in abilities_str.split(',') if ability_id.strip()]
+        for ability_id in ability_id_list:
             if await self.get_service('data_svc').locate('abilities', dict(ability_id=ability_id.strip())):
                 abilities.append(ability_id)
             else:

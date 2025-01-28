@@ -9,9 +9,9 @@ class ParserConfigSchema(ma.Schema):
         unknown = ma.INCLUDE
 
     source = ma.fields.String()
-    edge = ma.fields.String(missing=None)
-    target = ma.fields.String(missing=None)
-    custom_parser_vals = ma.fields.Mapping(keys=ma.fields.String(), values=ma.fields.String())
+    edge = ma.fields.String(load_default=None)
+    target = ma.fields.String(load_default=None)
+    custom_parser_vals = ma.fields.Dict(keys=ma.fields.String(), values=ma.fields.String())
 
     @ma.pre_load
     def check_edge_target(self, in_data, **_):

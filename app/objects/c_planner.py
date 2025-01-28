@@ -16,7 +16,13 @@ class PlannerSchema(ma.Schema):
     stopping_conditions = ma.fields.List(ma.fields.Nested(FactSchema()))
     ignore_enforcement_modules = ma.fields.List(ma.fields.String())
     allow_repeatable_abilities = ma.fields.Boolean()
-    plugin = ma.fields.String(missing=None)
+    plugin = ma.fields.String(load_default=None)
+
+    @ma.pre_load
+    def fix_id(self, data, **_):
+        if 'planner_id' in data:
+            data['id'] = data.pop('planner_id')
+        return data
 
     @ma.post_load()
     def build_planner(self, data, **kwargs):
@@ -54,6 +60,8 @@ class Planner(FirstClassObjectInterface, BaseObject):
             existing.update('stopping_conditions', self.stopping_conditions)
             existing.update('params', self.params)
             existing.update('plugin', self.plugin)
+            existing.update('description', self.description)
+            existing.update('allow_repeatable_abilities', self.allow_repeatable_abilities)
         return existing
 
     async def which_plugin(self):
